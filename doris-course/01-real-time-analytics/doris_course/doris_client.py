@@ -867,6 +867,91 @@ class DorisLab:
         show_log("View the complete EXPLAIN plans", "\n\n".join(raw_plans))
         return frame
 
+    def compare_join_plans(
+        self,
+        cases: Sequence[tuple[str, str]],
+        *,
+        title: str = "Join plan comparison",
+    ) -> pd.DataFrame:
+        """Summarize physical Join evidence while keeping complete plans available."""
+        connection = self._require_connection()
+        rows: list[dict[str, str]] = []
+        raw_plans: list[str] = []
+        for label, statement in cases:
+            normalized = statement.strip().rstrip(";")
+            if not normalized.upper().startswith("EXPLAIN SHAPE PLAN"):
+                raise ValueError(f"EXPLAIN SHAPE PLAN expected for {label!r}.")
+            with connection.cursor() as cursor:
+                cursor.execute(normalized)
+                records = cursor.fetchall()
+            plan = "\n".join(str(next(iter(record.values()))) for record in records)
+            raw_plans.append(f"--- {label} ---\n{plan}")
+
+            join_match = re.search(
+                r"(?im)\b(hashJoin|nestedLoopJoin)\s*\[([^\]]+)\]([^\n]*)",
+                plan,
+            )
+            if join_match:
+                operator_token, attributes, remainder = join_match.groups()
+                physical_join = (
+                    "Hash Join" if operator_token.lower() == "hashjoin"
+                    else "Nested Loop Join"
+                )
+                attribute_tokens = attributes.strip().split()
+                join_type = attribute_tokens[0].replace("_", " ").title()
+                strategy_names = {
+                    "broadcast": "Broadcast",
+                    "shuffle": "Partition Shuffle",
+                    "shufflebucket": "Bucket Shuffle",
+                    "bucket_shuffle": "Bucket Shuffle",
+                    "colocate": "Colocate",
+                }
+                strategy = next(
+                    (
+                        strategy_names[token.lower()]
+                        for token in attribute_tokens[1:]
+                        if token.lower() in strategy_names
+                    ),
+                    "No Shuffle Strategy",
+                )
+                runtime_filter = (
+                    "Generated"
+                    if re.search(r"build\s*RFs:\s*RF\d+", remainder, re.IGNORECASE)
+                    else "Not shown"
+                )
+            else:
+                physical_join = "not shown"
+                join_type = "not shown"
+                strategy = "not shown"
+                runtime_filter = "not shown"
+
+            rows.append({
+                "query": label,
+                "physical join": physical_join,
+                "join type": join_type,
+                "distribution": strategy,
+                "runtime filter": runtime_filter,
+            })
+
+        frame = pd.DataFrame(rows)
+        show_frame(title, frame)
+        show_log("View the complete EXPLAIN SHAPE PLAN output", "\n\n".join(raw_plans))
+        return frame
+
+    def explain_plan(self, statement: str, *, title: str = "EXPLAIN plan") -> str:
+        """Display an EXPLAIN result verbatim as an expanded plan tree."""
+        normalized = statement.strip().rstrip(";")
+        if not normalized.upper().startswith("EXPLAIN"):
+            raise ValueError("An EXPLAIN statement is required.")
+        connection = self._require_connection()
+        executable, _visible = self._expand_sql(normalized)
+        with connection.cursor() as cursor:
+            cursor.execute(executable)
+            records = cursor.fetchall()
+        plan = "\n".join(str(next(iter(record.values()))) for record in records)
+        show_log(title, plan, opened=True)
+        return plan
+
     @staticmethod
     def _normalize_statement(statement: str) -> str:
         return " ".join(statement.strip().rstrip(";").split()).lower()
@@ -944,6 +1029,87 @@ class DorisLab:
                     raise
             time.sleep(0.4)
         raise RuntimeError(f"The Query Profile was not ready: {last_error or 'timed out'}")
+
+    def show_join_runtime_filter_profile(
+        self,
+        statement: str,
+        *,
+        probe_table: str,
+        title: str = "Probe-side Runtime Filter Profile",
+    ) -> str:
+        """Run a Join query and display the relevant raw MergedProfile counters."""
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", probe_table):
+            raise ValueError("probe_table must be an unqualified table name.")
+        query = statement.strip().rstrip(";")
+        if not query.upper().startswith("SELECT "):
+            raise ValueError("A SELECT statement is required.")
+
+        connection = self._require_connection()
+        settings = {
+            "enable_profile": "true",
+            "profile_level": "2",
+            "enable_condition_cache": "false",
+            "enable_query_cache": "false",
+            "enable_sql_cache": "false",
+        }
+        originals: dict[str, str] = {}
+        try:
+            with connection.cursor() as cursor:
+                for name, value in settings.items():
+                    cursor.execute(f"SHOW VARIABLES LIKE '{name}'")
+                    row = cursor.fetchone()
+                    if row is None:
+                        raise RuntimeError(f"Doris did not expose the session variable {name}.")
+                    originals[name] = str(row["Value"])
+                    cursor.execute(f"SET {name} = {value}")
+
+            existing_ids = {str(row["Profile ID"]) for row in self._query_profiles()}
+            with connection.cursor() as cursor:
+                cursor.execute(query)
+                result = cursor.fetchone()
+
+            profile_id = self._latest_profile_id(query, exclude=existing_ids)
+            profile = self._profile_text(profile_id)
+            merged = profile.split("MergedProfile:", 1)[-1].split("DetailProfile", 1)[0]
+            scan_header = re.search(
+                rf"(?m)^\s*OLAP_SCAN_OPERATOR\([^\n]*table_name={re.escape(probe_table)}\(",
+                merged,
+            )
+            if scan_header is None:
+                raise RuntimeError(f"The Profile has no merged Scan for {probe_table}.")
+
+            join_header = merged.rfind("HASH_JOIN_OPERATOR(", 0, scan_header.start())
+            join_block = merged[join_header:scan_header.start()] if join_header >= 0 else ""
+            next_operator = re.search(
+                r"(?m)^\s*[A-Z][A-Z_]+_OPERATOR\(",
+                merged[scan_header.end():],
+            )
+            scan_end = (
+                scan_header.end() + next_operator.start()
+                if next_operator else len(merged)
+            )
+            scan_block = merged[scan_header.start():scan_end]
+            join_lines = [
+                line for line in join_block.splitlines()
+                if "HASH_JOIN_OPERATOR(" in line or re.search(r"- ProbeRows:", line)
+            ]
+            scan_lines = [
+                line for line in scan_block.splitlines()
+                if "OLAP_SCAN_OPERATOR(" in line
+                or re.search(r"- (?:RowsProduced|ScanRows):", line)
+                or re.search(r"- RF\d+ (?:InputRows|FilterRows):", line)
+            ]
+            if not any(re.search(r"- RF\d+ FilterRows:", line) for line in scan_lines):
+                raise RuntimeError("The probe Scan Profile has no Runtime Filter row counters.")
+            excerpt = "\n".join(join_lines + scan_lines)
+            result_text = ", ".join(f"{name}={value}" for name, value in (result or {}).items())
+            print(f"Query result: {result_text}")
+            show_log(title, excerpt, opened=True)
+            return excerpt
+        finally:
+            with connection.cursor() as cursor:
+                for name, value in originals.items():
+                    cursor.execute(f"SET {name} = {value}")
 
     def compare_profiles(
         self,
@@ -1236,6 +1402,247 @@ class DorisLab:
         }})();
         """
         display(Javascript(script))
+
+    def function_category_activity(self) -> None:
+        """Match representative Doris expressions to their function categories."""
+        items = [
+            {
+                "id": "A",
+                "title": "Transform each input row",
+                "detail": "Normalize an event type without changing the number of input rows.",
+                "answer": "LOWER(event_type)",
+                "reason": "LOWER is a scalar function: it produces one value for each input row.",
+            },
+            {
+                "id": "B",
+                "title": "Combine values across rows",
+                "detail": "Calculate one revenue total for every group.",
+                "answer": "SUM(revenue)",
+                "reason": "SUM is an aggregate function: it combines values from multiple rows into one grouped value.",
+            },
+            {
+                "id": "C",
+                "title": "Adapt an aggregate for ARRAY positions",
+                "detail": "Sum the first elements together, the second elements together, and so on.",
+                "answer": "SUM_FOREACH(metric_array)",
+                "reason": "SUM_FOREACH is an aggregate combinator: it applies SUM independently at each ARRAY position across rows.",
+            },
+            {
+                "id": "D",
+                "title": "Add a value while retaining result rows",
+                "detail": "Rank products inside each region without first reducing the ranked rows.",
+                "answer": "ROW_NUMBER() OVER (...) ",
+                "reason": "ROW_NUMBER is a window function: it adds a value to each row in its window.",
+            },
+            {
+                "id": "E",
+                "title": "Expand a collection stored in one row",
+                "detail": "Turn every tag in an event's ARRAY into a separate result row.",
+                "answer": "EXPLODE(tags)",
+                "reason": "EXPLODE is a table function: with LATERAL VIEW, it can produce zero to many rows for each input row.",
+            },
+            {
+                "id": "F",
+                "title": "Create a relation without an input table",
+                "detail": "Generate four numbered rows that SELECT can use directly in FROM.",
+                "answer": "NUMBERS(...) TVF",
+                "reason": "NUMBERS is a table-valued function: the function itself supplies a temporary relation for FROM.",
+            },
+            {
+                "id": "G",
+                "title": "Classify text with an external model",
+                "detail": "Send text through a configured Doris AI Resource and return a sentiment label.",
+                "answer": "AI_SENTIMENT(resource, text)",
+                "reason": "AI_SENTIMENT is an AI function. It has scalar row shape, but also depends on an external model configured through an AI Resource.",
+            },
+        ]
+        methods = [
+            "NUMBERS(...) TVF",
+            "ROW_NUMBER() OVER (...) ",
+            "EXPLODE(tags)",
+            "LOWER(event_type)",
+            "AI_SENTIMENT(resource, text)",
+            "SUM_FOREACH(metric_array)",
+            "SUM(revenue)",
+        ]
+        widget_id = "doris-function-match-" + uuid.uuid4().hex
+        method_html = "".join(
+            f'<button type="button" class="doris-method" draggable="true" data-method="{html.escape(method)}">'
+            f'{html.escape(method)}</button>'
+            for method in methods
+        )
+        cards = []
+        for item in items:
+            cards.append(
+                f'<section class="doris-scenario" data-answer="{html.escape(item["answer"])}" '
+                f'data-reason="{html.escape(item["reason"])}" tabindex="0" role="button">'
+                f'<div class="doris-scenario-title"><span class="doris-scenario-letter">{item["id"]}</span>'
+                f'<span>{html.escape(item["title"])}</span></div>'
+                f'<p class="doris-match-help" style="margin:8px 0">{html.escape(item["detail"])}</p>'
+                '<div class="doris-dropzone">Drop the matching expression here, or select an expression and click this card.</div>'
+                '<div class="doris-match-feedback" aria-live="polite"></div></section>'
+            )
+        display(HTML(
+            f'<div id="{widget_id}" class="doris-match">'
+            '<div class="doris-match-head"><div><div class="doris-match-title">'
+            'Match each requirement to a Doris function category</div>'
+            '<p class="doris-match-help">Drag each expression onto one requirement. If dragging is unavailable, '
+            'select an expression and then click a requirement card. A correct match explains the row-shape behavior.</p></div>'
+            '<div class="doris-match-score"><span data-score>0</span>/7 matched</div></div>'
+            f'<div class="doris-method-bank">{method_html}</div>'
+            f'<div class="doris-scenario-grid">{"".join(cards)}</div>'
+            '<div class="doris-match-actions"><button type="button" class="doris-match-reset">Reset matches</button></div>'
+            '</div>'
+        ))
+        script = f"""
+        (() => {{
+          const root = document.getElementById({json.dumps(widget_id)});
+          if (!root) return;
+          const bank = root.querySelector('.doris-method-bank');
+          const methods = [...root.querySelectorAll('.doris-method')];
+          const cards = [...root.querySelectorAll('.doris-scenario')];
+          let selected = null;
+          const choose = (button) => {{
+            if (button.disabled) return;
+            methods.forEach(item => item.classList.remove('selected'));
+            selected = button.dataset.method;
+            button.classList.add('selected');
+          }};
+          const attempt = (card) => {{
+            if (!selected || card.dataset.solved === 'true') return;
+            const feedback = card.querySelector('.doris-match-feedback');
+            if (selected === card.dataset.answer) {{
+              card.dataset.solved = 'true';
+              card.classList.remove('wrong'); card.classList.add('correct');
+              const button = methods.find(item => item.dataset.method === selected);
+              card.querySelector('.doris-dropzone').replaceChildren(button);
+              button.disabled = true; button.draggable = false; button.classList.remove('selected');
+              feedback.textContent = card.dataset.reason;
+              selected = null;
+              root.querySelector('[data-score]').textContent = String(cards.filter(item => item.dataset.solved === 'true').length);
+            }} else {{
+              card.classList.add('wrong');
+              feedback.textContent = 'Not this expression. Compare the input, output row shape, and whether the operation depends on an existing input row or an external service.';
+            }}
+          }};
+          methods.forEach(button => {{
+            button.addEventListener('click', () => choose(button));
+            button.addEventListener('dragstart', event => {{
+              choose(button);
+              event.dataTransfer.setData('text/plain', button.dataset.method);
+              event.dataTransfer.effectAllowed = 'move';
+            }});
+          }});
+          cards.forEach(card => {{
+            card.addEventListener('dragover', event => {{
+              event.preventDefault(); card.classList.add('over');
+            }});
+            card.addEventListener('dragleave', () => card.classList.remove('over'));
+            card.addEventListener('drop', event => {{
+              event.preventDefault(); card.classList.remove('over');
+              const method = event.dataTransfer.getData('text/plain');
+              if (method) selected = method;
+              attempt(card);
+            }});
+            card.addEventListener('click', () => attempt(card));
+            card.addEventListener('keydown', event => {{
+              if (event.key === 'Enter' || event.key === ' ') {{ event.preventDefault(); attempt(card); }}
+            }});
+          }});
+          root.querySelector('.doris-match-reset').addEventListener('click', () => {{
+            methods.forEach(button => {{
+              button.disabled = false; button.draggable = true; button.classList.remove('selected'); bank.appendChild(button);
+            }});
+            cards.forEach(card => {{
+              card.dataset.solved = 'false'; card.classList.remove('correct', 'wrong');
+              card.querySelector('.doris-dropzone').textContent = 'Drop the matching expression here, or select an expression and click this card.';
+              card.querySelector('.doris-match-feedback').textContent = '';
+            }});
+            selected = null; root.querySelector('[data-score]').textContent = '0';
+          }});
+        }})();
+        """
+        display(Javascript(script))
+
+    def expected_sql_error(
+        self,
+        statement: str,
+        *,
+        contains: str,
+        title: str = "Expected query rejection",
+    ) -> str:
+        """Run an intentionally invalid query and render its expected diagnostic compactly."""
+        connection = self._require_connection()
+        executable, _visible = self._expand_sql(statement.strip())
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(executable)
+        except pymysql.MySQLError as exc:
+            message = str(exc)
+            if contains.lower() not in message.lower():
+                raise
+            detail = message.split("detailMessage =", 1)[-1].strip(" ')\n")
+            card(detail, "warn", title)
+            return message
+        raise AssertionError("Doris accepted a query that this exercise expected it to reject.")
+
+    def guided_analysis_builder(self) -> None:
+        """Render a small guided query builder and execute the selected analysis."""
+        try:
+            import ipywidgets as widgets
+            from IPython.display import clear_output
+        except ImportError as exc:  # pragma: no cover - learner environment diagnostic
+            raise RuntimeError("ipywidgets is required. Install the course requirements and restart the kernel.") from exc
+
+        grains = {
+            "Day": "TO_DATE(event_time)",
+            "Week": "DATE_TRUNC(event_time, 'week')",
+            "Month": "DATE_TRUNC(event_time, 'month')",
+        }
+        metrics = {
+            "Event count": "COUNT(*)",
+            "Active users": "COUNT(DISTINCT user_id)",
+            "Revenue": "SUM(revenue)",
+        }
+        filters = {
+            "All event types": "",
+            "Views only": "  AND event_type = 'view'\n",
+            "Carts only": "  AND event_type = 'cart'\n",
+            "Purchases only": "  AND event_type = 'purchase'\n",
+        }
+        grain = widgets.Dropdown(options=list(grains), value="Day", description="Grain:")
+        event_filter = widgets.Dropdown(options=list(filters), value="Purchases only", description="Rows:")
+        metric = widgets.Dropdown(options=list(metrics), value="Revenue", description="Metric:")
+        run_button = widgets.Button(description="Run guided query", button_style="success", icon="play")
+        output = widgets.Output()
+
+        def run_query(_button=None):
+            period = grains[grain.value]
+            metric_expression = metrics[metric.value]
+            alias = {"Event count": "event_count", "Active users": "active_users", "Revenue": "total_revenue"}[metric.value]
+            statement = f"""
+SELECT
+    {period} AS reporting_period,
+    {metric_expression} AS {alias}
+FROM events_modelled
+WHERE event_time >= '2020-03-01 00:00:00'
+  AND event_time <  '2020-03-09 00:00:00'
+{filters[event_filter.value]}GROUP BY {period}
+ORDER BY {alias} DESC, reporting_period
+LIMIT 10
+""".strip()
+            with output:
+                clear_output(wait=True)
+                show_sql(statement, "Generated Doris SQL")
+                self.sql(statement, title="Guided analysis result")
+
+        run_button.on_click(run_query)
+        display(widgets.VBox([
+            widgets.HTML("<b>Choose the reporting grain, input rows, and metric.</b> The generated SQL remains visible."),
+            widgets.HBox([grain, event_filter, metric]),
+            run_button,
+            output,
+        ]))
 
     @staticmethod
     def new_run_suffix() -> str:
