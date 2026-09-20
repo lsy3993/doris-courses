@@ -537,6 +537,82 @@ class DorisLab:
             columns=columns,
         )
 
+    def query(self, statement: str):
+        """Execute a SQL query and return all rows without displaying them."""
+        connection = self._require_connection()
+        executable, _visible = self._expand_sql(statement.strip())
+        with connection.cursor() as cursor:
+            cursor.execute(executable)
+            if cursor.description is None:
+                raise ValueError("query() requires a statement that returns rows.")
+            rows = cursor.fetchall()
+            columns = [column[0] for column in cursor.description]
+        return pd.DataFrame(rows, columns=columns)
+
+    def compare_queries(
+        self,
+        left_sql: str,
+        right_sql: str,
+        *,
+        left_label: str,
+        right_label: str,
+        title: str = "Query-result comparison",
+    ):
+        """Run two SQL statements, summarize their full row comparison, and return both results."""
+        from collections import Counter
+
+        left = self.query(left_sql)
+        right = self.query(right_sql)
+        differing_rows = None
+        if list(left.columns) == list(right.columns):
+            left_rows = Counter(left.itertuples(index=False, name=None))
+            right_rows = Counter(right.itertuples(index=False, name=None))
+            differing_rows = sum((left_rows - right_rows).values())
+            differing_rows += sum((right_rows - left_rows).values())
+        show_frame(title, pd.DataFrame([{
+            "left_result": left_label,
+            "left_rows": len(left.index),
+            "right_result": right_label,
+            "right_rows": len(right.index),
+            "differing_rows": differing_rows if differing_rows is not None else "column mismatch",
+        }]))
+        self.assert_same_rows(left, right)
+        return left, right
+
+    def summarize_query_values(
+        self,
+        left_sql: str,
+        right_sql: str,
+        *,
+        left_label: str,
+        right_label: str,
+        value_column: str,
+        values: Sequence[object],
+        metrics: Sequence[str],
+        title: str,
+    ):
+        """Run two SQL statements and summarize selected values from each result."""
+        left = self.query(left_sql)
+        right = self.query(right_sql)
+        rows = []
+        for label, frame in ((left_label, left), (right_label, right)):
+            if value_column not in frame.columns:
+                raise ValueError(f"Value column {value_column!r} is missing from the result.")
+            for value in values:
+                focused = frame.loc[frame[value_column] == value]
+                row = {
+                    "result": label,
+                    value_column: value,
+                    "groups": len(focused.index),
+                }
+                for metric in metrics:
+                    if metric not in frame.columns:
+                        raise ValueError(f"Metric {metric!r} is missing from the result.")
+                    row[metric] = focused[metric].sum()
+                rows.append(row)
+        show_frame(title, pd.DataFrame(rows))
+        return left, right
+
     def execute(self, statement: str) -> int:
         connection = self._require_connection()
         executable, _visible = self._expand_sql(statement.strip())
@@ -950,6 +1026,33 @@ class DorisLab:
             records = cursor.fetchall()
         plan = "\n".join(str(next(iter(record.values()))) for record in records)
         show_log(title, plan, opened=True)
+        return plan
+
+    def explain_selected_scans(
+        self,
+        statement: str,
+        *,
+        title: str = "Selected scans",
+        expected_table: str | None = None,
+        expected_index: str | None = None,
+    ) -> str:
+        """Execute EXPLAIN, verify an optional scan, and display selected TABLE lines."""
+        normalized = statement.strip()
+        if not normalized.upper().startswith("EXPLAIN"):
+            raise ValueError("An EXPLAIN statement is required.")
+        connection = self._require_connection()
+        with connection.cursor() as cursor:
+            cursor.execute(normalized)
+            records = cursor.fetchall()
+        plan = "\n".join(str(next(iter(record.values()))) for record in records)
+        if expected_table is not None:
+            table = self._safe_table_name(expected_table)
+            index = self._safe_table_name(expected_index or expected_table)
+            pattern = rf"TABLE:\s*(?:[\w`]+\.)?`?{table}`?\s*\(\s*{index}\s*\)"
+            if not re.search(pattern, plan):
+                raise AssertionError(f"Expected selected scan {table}({index}) was not found.")
+        scans = [line for line in plan.splitlines() if re.match(r"\s*TABLE:", line)]
+        show_log(title, "\n".join(scans) or "Selected TABLE lines are not shown.", opened=True)
         return plan
 
     @staticmethod
@@ -1886,6 +1989,138 @@ LIMIT 10
         show_sql("Content returned by ErrorURL", error_log)
         return error_log
 
+    def sync_mv_jobs(self, table, view, *, database="doris_course"):
+        """Return build jobs for one synchronous materialized view."""
+        table = self._safe_table_name(table)
+        view = self._safe_table_name(view)
+        database = self._safe_table_name(database)
+        return [row for row in self._metadata_rows(
+            f"SHOW ALTER TABLE MATERIALIZED VIEW FROM `{database}`"
+        ) if row["TableName"] == table and row["RollupIndexName"] == view]
+
+    def async_mv_tasks(self, view, *, database="doris_course"):
+        """Return refresh tasks for one asynchronous materialized view."""
+        view = self._safe_table_name(view)
+        database = self._safe_table_name(database)
+        return self._metadata_rows(f"""SELECT * FROM tasks("type"="mv")
+            WHERE MvDatabaseName = '{database}' AND MvName = '{view}'""")
+
+    def capture_query(self, statement, *, settings=None):
+        """Capture the result, plan and fresh runtime Profile on this lab session."""
+        from .profiles import capture_query
+        return capture_query(self, statement, settings=settings)
+
+    def verify_query_change(
+        self,
+        statement: str,
+        baseline: pd.DataFrame,
+        *,
+        match: Mapping[str, object],
+        expected_changes: Mapping[str, object],
+        title: str = "Observed result change",
+    ):
+        """Run SQL and display only one matched row's verified changes."""
+        from .profiles import show_result_change
+
+        rows = self.query(statement)
+        show_result_change(
+            rows,
+            title,
+            baseline,
+            match=match,
+            metrics=tuple(expected_changes),
+            expected_changes=expected_changes,
+        )
+        return rows
+
+    def session_settings(self, settings):
+        """Temporarily apply session settings and restore them on context exit."""
+        from .profiles import session_settings
+        return session_settings(self, settings)
+
+    @staticmethod
+    def _wait_mv_job(fetch, matches, id_key, state_key, before, success, failures, timeout):
+        deadline = time.monotonic() + timeout
+        last = []
+        while time.monotonic() < deadline:
+            last = [row for row in fetch() if matches(row) and str(row[id_key]) not in before]
+            if len(last) > 1:
+                raise RuntimeError(f"Multiple new jobs found; avoid concurrent operations on the same materialized view: {last}")
+            if last:
+                row = last[0]
+                state = str(row[state_key]).upper()
+                if state == success:
+                    return row
+                if state in failures:
+                    raise RuntimeError(f"Background job failed: {row}")
+            time.sleep(0.5)
+        raise TimeoutError(f"Background job did not finish within {timeout}s. Last matching rows: {last}")
+
+    def wait_for_sync_mv(self, table, view, before, *, database="doris_course", timeout=120):
+        row = self._wait_mv_job(
+            lambda: self.sync_mv_jobs(table, view, database=database),
+            lambda r: True,
+            "JobId", "State", {str(x) for x in before}, "FINISHED", {"CANCELLED", "FAILED"}, timeout,
+        )
+        show_frame("Synchronous materialized-view build", pd.DataFrame([{
+            "Base table": row["TableName"],
+            "Materialized view": row["RollupIndexName"],
+            "Build state": row["State"],
+        }]))
+        show_log("Complete synchronous build task", json.dumps(row, indent=2, default=str))
+        return row
+
+    def wait_for_async_refresh(self, view, before, *, database="doris_course", timeout=120):
+        row = self._wait_mv_job(
+            lambda: self.async_mv_tasks(view, database=database), lambda r: True, "TaskId", "Status",
+            {str(x) for x in before}, "SUCCESS", {"FAILED", "FAIL", "CANCELED", "CANCELLED"}, timeout,
+        )
+        show_frame("Completed manual refresh task", pd.DataFrame([{
+            "TaskId": row.get("TaskId"),
+            "MvName": row.get("MvName"),
+            "Status": row.get("Status"),
+            "RefreshMode": row.get("RefreshMode"),
+            "Progress": row.get("Progress"),
+        }]))
+        return row
+
+    def wait_for_mv_jobs(self, table, sync_view, async_view, *, database="doris_course", timeout=120):
+        """Wait for earlier jobs on the explicitly named objects before resetting them."""
+        deadline = time.monotonic() + timeout
+        last = []
+        while time.monotonic() < deadline:
+            last = [r for r in self.sync_mv_jobs(table, sync_view, database=database)
+                    if str(r["State"]).upper() not in {"FINISHED", "CANCELLED", "FAILED"}]
+            last += [r for r in self.async_mv_tasks(async_view, database=database)
+                     if str(r["Status"]).upper() not in {"SUCCESS", "FAILED", "FAIL", "CANCELED", "CANCELLED"}]
+            if not last:
+                return
+            time.sleep(0.5)
+        raise TimeoutError(f"Earlier materialized-view jobs are still active; objects were not reset: {last}")
+
+    @staticmethod
+    def assert_scan(evidence, table, index=None):
+        """Check the chosen scan line, not an optimizer candidate/rewrite summary."""
+        DorisLab._safe_table_name(table)
+        index = DorisLab._safe_table_name(index or table)
+        pattern = rf"TABLE:\s*(?:[\w`]+\.)?`?{table}`?\s*\(\s*{index}\s*\)"
+        if not re.search(pattern, evidence.plan):
+            raise AssertionError(
+                f"Expected selected scan {table}({index}) was not found. "
+                "Inspect the displayed EXPLAIN and current build/statistics before claiming a rewrite."
+            )
+
+    @staticmethod
+    def assert_same_rows(left, right):
+        """Compare complete result multisets, including duplicate multiplicities."""
+        from collections import Counter
+
+        if list(left.columns) != list(right.columns):
+            raise AssertionError(f"Different result columns: {list(left.columns)} vs {list(right.columns)}")
+        if Counter(left.itertuples(index=False, name=None)) != Counter(right.itertuples(index=False, name=None)):
+            raise AssertionError("The complete grouped results differ; inspect both results before continuing.")
+
+
     def wait_for_table_rows(
         self,
         table_name: str,
@@ -2310,6 +2545,80 @@ LIMIT 10
         if output:
             show_log("View full command log", output)
         return result
+
+    def ensure_docker_ready(self, *, timeout_seconds: int = 180) -> None:
+        """Ensure the Docker daemon is reachable, starting Docker Desktop on macOS."""
+        if shutil.which("docker") is None:
+            raise RuntimeError("Docker CLI was not found in PATH.")
+
+        ready, output = docker_preflight()
+        if ready:
+            card("Docker daemon is already running", "ok")
+            return
+
+        if platform.system() != "Darwin":
+            raise RuntimeError(
+                "Docker Engine is not running. Start it on this host, then rerun this cell. "
+                f"Docker reported: {output or 'no diagnostic output'}"
+            )
+
+        launched = run(["open", "-a", "Docker"], check=False)
+        if launched.returncode != 0:
+            raise RuntimeError(
+                "Docker Desktop could not be opened. Start it manually, then rerun this cell."
+            )
+
+        deadline = time.monotonic() + timeout_seconds
+        last_output = output
+        while time.monotonic() < deadline:
+            ready, last_output = docker_preflight()
+            if ready:
+                card("Docker Desktop is running", "ok")
+                return
+            time.sleep(2)
+        raise TimeoutError(
+            f"Docker Desktop did not become ready within {timeout_seconds} seconds. "
+            f"Last diagnostic: {last_output or 'no diagnostic output'}"
+        )
+
+    def start_container(
+        self,
+        container: str,
+        *,
+        wait_for_healthy: bool = True,
+        timeout_seconds: int = 300,
+    ) -> dict:
+        """Idempotently make an existing course container available again."""
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", container):
+            raise ValueError("container must be a simple Docker container name.")
+
+        self.ensure_docker_ready()
+        state = container_inspect(container)
+        if state is None:
+            raise RuntimeError(
+                f"Container {container!r} does not exist. Run that module's environment "
+                "preparation before using its restart cell."
+            )
+
+        status = str(state.get("State", {}).get("Status", "unknown"))
+        if status == "paused":
+            run(["docker", "unpause", container], show=True)
+        elif status not in {"running", "restarting"}:
+            run(["docker", "start", container], show=True)
+        else:
+            card(f"Reusing {status} container {container}", "ok")
+
+        if wait_for_healthy:
+            wait_for_health(container, timeout_seconds=timeout_seconds)
+        state = container_inspect(container)
+        assert state is not None
+        container_state = state.get("State", {})
+        show_frame("Sandbox container", pd.DataFrame([{
+            "container": container,
+            "status": container_state.get("Status", "unknown"),
+            "health": container_state.get("Health", {}).get("Status", "not configured"),
+        }]))
+        return state
 
     def connect(
         self,
